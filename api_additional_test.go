@@ -168,6 +168,60 @@ func TestStreamsPaginationFiltersAndMarkAllRead(t *testing.T) {
 	}
 }
 
+func TestStreamsReturnAllItemsWhenLimitIsOmitted(t *testing.T) {
+	s, app := testServer(t)
+	result, err := s.db.Exec(`INSERT INTO feeds(url,title) VALUES('https://example.test/feed','Feed')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedID, _ := result.LastInsertId()
+	now := time.Now().Unix()
+	for i := 0; i < 25; i++ {
+		_, err = s.db.Exec(`INSERT INTO entries(feed_id,guid,title,published,crawled) VALUES(?,?,?,?,?)`,
+			feedID, "item-"+strconv.Itoa(i), "Item "+strconv.Itoa(i), now-int64(i), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	token := login(t, app.URL)
+	endpoint := app.URL + "/api/greader.php/reader/api/0/"
+	response := authed(t, http.MethodGet, endpoint+"stream/contents/"+url.PathEscape(stateReading), token, nil)
+	var stream struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err = json.NewDecoder(response.Body).Decode(&stream); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(stream.Items) != 25 {
+		t.Fatalf("stream items=%d, want 25", len(stream.Items))
+	}
+
+	response = authed(t, http.MethodGet, endpoint+"stream/items/ids?s="+url.QueryEscape(stateReading), token, nil)
+	var ids struct {
+		Items        []map[string]any `json:"itemRefs"`
+		Continuation string           `json:"continuation"`
+	}
+	if err = json.NewDecoder(response.Body).Decode(&ids); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(ids.Items) != 25 || ids.Continuation != "" {
+		t.Fatalf("IDs response: items=%d continuation=%q, want 25 items and no continuation", len(ids.Items), ids.Continuation)
+	}
+
+	response = authed(t, http.MethodGet, endpoint+"stream/contents/"+url.PathEscape(stateReading)+"?n=20", token, nil)
+	stream.Items = nil
+	if err = json.NewDecoder(response.Body).Decode(&stream); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(stream.Items) != 20 {
+		t.Fatalf("limited stream items=%d, want 20", len(stream.Items))
+	}
+}
+
 func TestMetadataAuthenticationAndUnknownRoutes(t *testing.T) {
 	_, app := testServer(t)
 	response, err := http.Get(app.URL + "/healthz")
