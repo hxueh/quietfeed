@@ -221,7 +221,10 @@ func (s *server) streamContents(w http.ResponseWriter, r *http.Request, stream s
 }
 
 func (s *server) queryEntries(r *http.Request, stream string, ids []int64) ([]entry, error) {
-	n := parseLimit(r.FormValue("n"), 20, s.cfg.MaxItems)
+	n := 0
+	if value := r.FormValue("n"); value != "" {
+		n = parseLimit(value, 20, s.cfg.MaxItems)
+	}
 	offset := 0
 	if value := r.FormValue("c"); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
@@ -267,9 +270,14 @@ func (s *server) queryEntries(r *http.Request, stream string, ids []int64) ([]en
 	}
 	q := `SELECT e.id,e.feed_id,e.guid,e.title,e.url,e.author,e.content,e.summary,e.published,e.crawled,e.is_read,e.is_starred,f.title,f.site_url,
 	 COALESCE((SELECT group_concat(d.name,char(31)) FROM feed_folders ff JOIN folders d ON d.id=ff.folder_id WHERE ff.feed_id=f.id),'')
-	 FROM entries e JOIN feeds f ON f.id=e.feed_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY e.published DESC,e.id DESC LIMIT ? OFFSET ?`
-	args = append(args, n)
-	args = append(args, offset)
+	 FROM entries e JOIN feeds f ON f.id=e.feed_id WHERE ` + strings.Join(where, " AND ") + ` ORDER BY e.published DESC,e.id DESC`
+	if n > 0 {
+		q += ` LIMIT ? OFFSET ?`
+		args = append(args, n, offset)
+	} else if offset > 0 {
+		q += ` LIMIT -1 OFFSET ?`
+		args = append(args, offset)
+	}
 	rows, err := s.db.QueryContext(ctx(r), q, args...)
 	if err != nil {
 		return nil, err
@@ -357,8 +365,11 @@ func (s *server) streamItemIDs(w http.ResponseWriter, r *http.Request) {
 		refs = append(refs, map[string]any{"id": strconv.FormatInt(e.ID, 10), "timestampUsec": strconv.FormatInt(unixMicros(e.Published), 10)})
 	}
 	out := map[string]any{"itemRefs": refs}
-	n := parseLimit(r.FormValue("n"), 20, s.cfg.MaxItems)
-	if len(entries) == n {
+	n := 0
+	if value := r.FormValue("n"); value != "" {
+		n = parseLimit(value, 20, s.cfg.MaxItems)
+	}
+	if n > 0 && len(entries) == n {
 		offset := 0
 		if v, err := strconv.Atoi(r.FormValue("c")); err == nil {
 			offset = v
