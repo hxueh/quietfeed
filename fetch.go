@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-co-op/gocron/v2"
 	"github.com/mmcdole/gofeed"
 )
 
@@ -83,8 +84,15 @@ func isPublicIP(ip net.IP) bool {
 
 const failureThreshold = 3
 const failureRetryPeriods = 6
+const maxConcurrentFetches = 10
 
-func (f *refresher) refreshAll(ctx context.Context, readRetention, refreshInterval time.Duration) {
+type refreshResult struct {
+	feed feed
+	now  time.Time
+	err  error
+}
+
+func (f *refresher) refreshAll(ctx context.Context, readRetention, refreshInterval time.Duration) error {
 	started := time.Now()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -96,34 +104,86 @@ func (f *refresher) refreshAll(ctx context.Context, readRetention, refreshInterv
 	}
 	rows, err := f.db.QueryContext(ctx, `SELECT id,url,title,site_url,etag,modified,last_checked,consecutive_failures,next_check FROM feeds ORDER BY id`)
 	if err != nil {
-		f.logger.Error("list feeds", "error", err)
-		return
+		return fmt.Errorf("list feeds: %w", err)
 	}
 	var feeds []feed
 	for rows.Next() {
 		var x feed
-		if rows.Scan(&x.ID, &x.URL, &x.Title, &x.SiteURL, &x.ETag, &x.Modified, &x.LastChecked, &x.ConsecutiveFailures, &x.NextCheck) == nil {
-			feeds = append(feeds, x)
+		if err := rows.Scan(&x.ID, &x.URL, &x.Title, &x.SiteURL, &x.ETag, &x.Modified, &x.LastChecked, &x.ConsecutiveFailures, &x.NextCheck); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan feed: %w", err)
 		}
+		feeds = append(feeds, x)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list feeds: %w", err)
 	}
 	rows.Close()
 	f.logger.Info("refresh started", "feeds", len(feeds))
-	failed, attempted, skipped := 0, 0, 0
+	failed, skipped := 0, 0
+	ready := make([]feed, 0, len(feeds))
 	for _, x := range feeds {
-		now := time.Now()
-		if deferFailedFeed(x, now) {
+		if deferFailedFeed(x, time.Now()) {
 			skipped++
 			continue
 		}
-		attempted++
-		if err := f.refresh(ctx, x); err != nil {
+		ready = append(ready, x)
+	}
+	jobs := make(chan feed, len(ready))
+	results := make(chan refreshResult, len(ready))
+	for _, x := range ready {
+		jobs <- x
+	}
+	close(jobs)
+	workers := min(maxConcurrentFetches, len(ready))
+	var workersDone sync.WaitGroup
+	workersDone.Add(workers)
+	for range workers {
+		go func() {
+			defer workersDone.Done()
+			for x := range jobs {
+				now := time.Now()
+				results <- refreshResult{feed: x, now: now, err: f.refresh(ctx, x)}
+			}
+		}()
+	}
+	go func() {
+		workersDone.Wait()
+		close(results)
+	}()
+	for result := range results {
+		if result.err != nil {
 			failed++
-			f.logger.Warn("refresh failed", "feed", x.URL, "error", err)
-			failures, nextCheck := failedFeedSchedule(x, now, refreshInterval)
-			_, _ = f.db.ExecContext(ctx, `UPDATE feeds SET last_checked=?,last_error=?,consecutive_failures=?,next_check=? WHERE id=?`, now.Unix(), err.Error(), failures, nextCheck, x.ID)
+			f.logger.Warn("refresh failed", "feed", result.feed.URL, "error", result.err)
+			failures, nextCheck := failedFeedSchedule(result.feed, result.now, refreshInterval)
+			_, _ = f.db.ExecContext(ctx, `UPDATE feeds SET last_checked=?,last_error=?,consecutive_failures=?,next_check=? WHERE id=?`, result.now.Unix(), result.err.Error(), failures, nextCheck, result.feed.ID)
 		}
 	}
-	f.logger.Info("refresh completed", "feeds", len(feeds), "attempted", attempted, "skipped", skipped, "failed", failed, "duration", time.Since(started).Round(time.Second))
+	f.logger.Info("refresh completed", "feeds", len(feeds), "attempted", len(ready), "skipped", skipped, "failed", failed, "duration", time.Since(started).Round(time.Second))
+	return nil
+}
+
+func (f *refresher) startScheduler(ctx context.Context, every, readRetention time.Duration) (gocron.Scheduler, error) {
+	scheduler, err := gocron.NewScheduler()
+	if err != nil {
+		return nil, err
+	}
+	if _, err = scheduler.NewJob(
+		gocron.DurationJob(every),
+		gocron.NewTask(func() {
+			if err := f.refreshAll(ctx, readRetention, every); err != nil {
+				f.logger.Error("refresh error", "error", err)
+			}
+		}),
+		gocron.WithStartAt(gocron.WithStartImmediately()),
+		gocron.WithSingletonMode(gocron.LimitModeReschedule),
+	); err != nil {
+		_ = scheduler.Shutdown()
+		return nil, err
+	}
+	scheduler.Start()
+	return scheduler, nil
 }
 
 func deferFailedFeed(x feed, now time.Time) bool {
@@ -285,18 +345,4 @@ func feedItemTime(item *gofeed.Item) time.Time {
 		return *item.UpdatedParsed
 	}
 	return time.Time{}
-}
-
-func (f *refresher) run(ctx context.Context, every, readRetention time.Duration) {
-	f.refreshAll(ctx, readRetention, every)
-	t := time.NewTicker(every)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			f.refreshAll(ctx, readRetention, every)
-		}
-	}
 }

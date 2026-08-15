@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -10,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -123,19 +127,157 @@ func TestRefreshAllSuccessFailureAndCleanup(t *testing.T) {
 	}
 }
 
-func TestRefresherRunStopsWithContext(t *testing.T) {
-	s, _ := testServer(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+func TestRefreshAllLimitsConcurrentFetches(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := range 13 {
+		if _, err := db.Exec(`INSERT INTO feeds(url,title) VALUES(?,?)`, fmt.Sprintf("https://example.test/%d", i), "Feed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refresh := newRefresher(db, time.Second, 10, 10, 1024, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var active, maximum atomic.Int64
+	release := make(chan struct{})
+	limitStarted := make(chan struct{})
+	var signalOnce sync.Once
+	refresh.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		current := active.Add(1)
+		for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
+		}
+		if current == maxConcurrentFetches {
+			signalOnce.Do(func() { close(limitStarted) })
+		}
+		<-release
+		active.Add(-1)
+		body := `<?xml version="1.0"?><rss version="2.0"><channel><title>Feed</title><item><guid>one</guid></item></channel></rss>`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
 	done := make(chan struct{})
 	go func() {
-		s.refresh.run(ctx, time.Hour, 90*24*time.Hour)
+		refresh.refreshAll(context.Background(), 90*24*time.Hour, 20*time.Minute)
 		close(done)
 	}()
 	select {
-	case <-done:
+	case <-limitStarted:
 	case <-time.After(time.Second):
-		t.Fatal("refresher did not stop")
+		t.Fatal("maximum concurrent fetches did not start")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh did not finish")
+	}
+	if maximum.Load() != maxConcurrentFetches {
+		t.Fatalf("maximum concurrency=%d, want %d", maximum.Load(), maxConcurrentFetches)
+	}
+}
+
+func TestRefreshCleanupAndListingDatabaseErrors(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh := newRefresher(db, time.Second, 10, 10, 1024, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := refresh.pruneReadEntries(context.Background(), time.Hour, time.Now()); err == nil {
+		t.Fatal("pruning entries on a closed database succeeded")
+	}
+	if _, err := refresh.pruneExpiredSessions(context.Background(), time.Now()); err == nil {
+		t.Fatal("pruning sessions on a closed database succeeded")
+	}
+	refresh.refreshAll(context.Background(), time.Hour, time.Minute)
+}
+
+func TestRefreshRejectsInvalidFeedRows(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "invalid.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE feeds (id INTEGER, url TEXT, title TEXT, site_url TEXT, etag TEXT, modified TEXT, last_checked INTEGER, consecutive_failures INTEGER, next_check INTEGER);
+		CREATE TABLE entries (published INTEGER, is_read INTEGER);
+		CREATE TABLE sessions (expires INTEGER);
+		INSERT INTO feeds VALUES (1,NULL,'Feed','','','',0,0,0);`); err != nil {
+		t.Fatal(err)
+	}
+	refresh := newRefresher(db, time.Second, 10, 10, 1024, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := refresh.refreshAll(context.Background(), time.Hour, time.Minute); err == nil || !strings.Contains(err.Error(), "scan feed") {
+		t.Fatalf("unexpected refresh error: %v", err)
+	}
+}
+
+func TestRefreshSchedulerRunsImmediately(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO sessions(token,created,expires) VALUES('expired',0,0)`); err != nil {
+		t.Fatal(err)
+	}
+	refresh := newRefresher(db, time.Second, 10, 10, 1024, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scheduler, err := refresh.startScheduler(context.Background(), time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Shutdown()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		var sessions int
+		if err := db.QueryRow(`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+			t.Fatal(err)
+		}
+		if sessions == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("scheduled refresh did not run immediately")
+}
+
+type refreshErrorWriter struct {
+	once sync.Once
+	done chan struct{}
+}
+
+func (w *refreshErrorWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "refresh error") {
+		w.once.Do(func() { close(w.done) })
+	}
+	return len(p), nil
+}
+
+func TestRefreshSchedulerRejectsInvalidIntervalAndLogsJobErrors(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refresh := newRefresher(db, time.Second, 10, 10, 1024, true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if scheduler, err := refresh.startScheduler(context.Background(), 0, time.Hour); err == nil {
+		scheduler.Shutdown()
+		t.Fatal("zero refresh interval was accepted")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer := &refreshErrorWriter{done: make(chan struct{})}
+	refresh.logger = slog.New(slog.NewTextHandler(writer, nil))
+	scheduler, err := refresh.startScheduler(context.Background(), time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scheduler.Shutdown()
+	select {
+	case <-writer.done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled refresh error was not logged")
 	}
 }
 
@@ -145,6 +287,9 @@ func TestPublicDialRejectsLocalAddress(t *testing.T) {
 	}
 	if _, err := publicDialContext(context.Background(), "tcp", "missing-port"); err == nil {
 		t.Fatal("invalid address was accepted")
+	}
+	if _, err := publicDialContext(context.Background(), "tcp", "quietfeed-does-not-exist.invalid:80"); err == nil {
+		t.Fatal("unresolvable feed host was accepted")
 	}
 }
 
@@ -167,6 +312,24 @@ func TestOpenDBAndOPMLErrors(t *testing.T) {
 	}
 	if _, err = importOPML(context.Background(), db, badOPML); err == nil {
 		t.Fatal("malformed OPML was accepted")
+	}
+}
+
+func TestOpenDBRejectsIncompleteLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broken.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE feeds (id INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if db, err := openDB(path); err == nil {
+		db.Close()
+		t.Fatal("incomplete feed schema was accepted")
 	}
 }
 

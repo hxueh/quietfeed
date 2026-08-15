@@ -7,7 +7,7 @@ QuietFeed is a small, single-user RSS synchronization daemon written in Go. It s
 - Google Reader-compatible synchronization for Reeder Classic
 - SQLite storage with WAL enabled
 - Feed folders, unread state, stars, and OPML import
-- Configurable refresh and retention periods
+- In-process gocron scheduling with at most 10 concurrent feed fetches
 - Conditional feed requests with failure backoff
 - A 10 MiB decompressed response limit and private-network fetch protection
 - A hardened systemd unit and Unix socket integration with Caddy
@@ -22,7 +22,7 @@ mkdir -p ./run
 QUIETFEED_PASSWORD='choose-a-long-password' QUIETFEED_SOCKET="$PWD/run/quietfeed.sock" ./quietfeed
 ```
 
-The database is created as `quietfeed.db`. The service refreshes feeds immediately at startup and every 20 minutes thereafter. During each refresh, read articles older than 90 days are deleted; unread and starred articles are retained unless they have also been marked read.
+The database is created as `quietfeed.db`. The service uses gocron to refresh immediately at startup and at the configured interval. Each run fetches at most 10 feeds concurrently and deletes read articles older than 90 days; unread and starred articles are retained unless they have also been marked read.
 
 The first successful fetch for a newly added feed keeps at most the 20 newest articles. Later refreshes add newer posts without backfilling entries older than that initial boundary.
 
@@ -127,7 +127,7 @@ quietfeed -remove-feed https://example.com/feed.xml -db /var/lib/quietfeed/quiet
 | `QUIETFEED_DB` | `quietfeed.db` | SQLite file |
 | `QUIETFEED_REFRESH_INTERVAL` | `20m` | Feed refresh interval |
 | `QUIETFEED_READ_RETENTION` | `2160h` | Retention period for read articles (90 days) |
-| `QUIETFEED_FETCH_TIMEOUT` | `20s` | Per-feed request timeout |
+| `QUIETFEED_FETCH_TIMEOUT` | `10s` | Per-feed request timeout |
 | `QUIETFEED_INITIAL_ITEMS` | `20` | Maximum articles retained from a newly added feed's first fetch |
 | `QUIETFEED_MAX_ITEMS` | `1000` | Maximum items parsed per refresh/API request |
 | `QUIETFEED_MAX_FEED_BYTES` | `10485760` | Maximum decompressed feed response size (10 MiB) |
