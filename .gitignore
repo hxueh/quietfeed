@@ -1,0 +1,7 @@
+/bin/
+*.db
+*.db-shm
+*.db-wal
+.env
+quietfeed.env
+coverage.out

@@ -1,0 +1,15 @@
+rss.example.com {
+	encode gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	@unsupported not method GET POST HEAD
+	respond @unsupported 405
+
+	reverse_proxy unix//run/quietfeed/quietfeed.sock
+}

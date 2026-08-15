@@ -1,0 +1,24 @@
+[Unit]
+Description=QuietFeed RSS synchronization service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quietfeed
+Group=caddy
+WorkingDirectory=/var/lib/quietfeed
+RuntimeDirectory=quietfeed
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/quietfeed.env
+ExecStart=/usr/local/bin/quietfeed
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quietfeed
+
+[Install]
+WantedBy=multi-user.target
