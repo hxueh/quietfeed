@@ -36,7 +36,7 @@ func loadConfig() (config, error) {
 	if c.ReadRetention, err = durationEnv("QUIETFEED_READ_RETENTION", 90*24*time.Hour); err != nil {
 		return c, err
 	}
-	if c.FetchTimeout, err = durationEnv("QUIETFEED_FETCH_TIMEOUT", 20*time.Second); err != nil {
+	if c.FetchTimeout, err = durationEnv("QUIETFEED_FETCH_TIMEOUT", 10*time.Second); err != nil {
 		return c, err
 	}
 	if c.InitialItems, err = intEnv("QUIETFEED_INITIAL_ITEMS", 20); err != nil {

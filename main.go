@@ -93,7 +93,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	serviceCtx, cancelService := context.WithCancel(ctx)
 	defer cancelService()
-	go refresh.run(serviceCtx, cfg.RefreshInterval, cfg.ReadRetention)
+	scheduler, err := refresh.startScheduler(serviceCtx, cfg.RefreshInterval, cfg.ReadRetention)
+	if err != nil {
+		logger.Error("refresh scheduler error", "error", err)
+		return 1
+	}
 	go func() {
 		logger.Info("QuietFeed started", "socket", cfg.Socket, "database", cfg.Database)
 		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -104,6 +108,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	<-serviceCtx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if err := scheduler.ShutdownWithContext(shutdownCtx); err != nil {
+		logger.Error("refresh scheduler shutdown failed", "error", err)
+	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown failed", "error", err)
 	}
