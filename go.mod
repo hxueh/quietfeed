@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/go-co-op/gocron/v2 v2.22.0
-	github.com/mmcdole/gofeed v1.4.1
+	github.com/mmcdole/gofeed v1.5.0
 	modernc.org/sqlite v1.56.0
 )
 
